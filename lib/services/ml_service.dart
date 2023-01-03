@@ -1,17 +1,20 @@
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math';
 import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:face_net_authentication/pages/db/databse_helper.dart';
 import 'package:face_net_authentication/pages/models/user.model.dart';
 import 'package:face_net_authentication/services/image_converter.dart';
+import 'package:flutter/foundation.dart';
 import 'package:google_ml_kit/google_ml_kit.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:image/image.dart' as imglib;
 
 class MLService {
-  Interpreter? _interpreter;
-  double threshold = 0.5;
+  Interpreter? interpreter;
+  double threshold = 0.75;
+  var assetName = 'facenet.tflite';
 
   List _predictedData = [];
   List get predictedData => _predictedData;
@@ -37,8 +40,10 @@ class MLService {
         );
       }
       var interpreterOptions = InterpreterOptions()..addDelegate(delegate);
+      interpreterOptions.threads = 2;
 
-      this._interpreter = await Interpreter.fromAsset('mobilefacenet.tflite',
+
+      interpreter = await Interpreter.fromAsset(assetName,
           options: interpreterOptions);
     } catch (e) {
       print('Failed to load model.');
@@ -46,25 +51,63 @@ class MLService {
     }
   }
 
-  void setCurrentPrediction(CameraImage cameraImage, Face? face) {
-    if (_interpreter == null) throw Exception('Interpreter is null');
+
+   Isolate? _isolate;
+   late ReceivePort receivePort;
+
+  // Call this to kill isolate
+  void _stopIsolate() {
+    if (_isolate != null) {
+      receivePort.close();
+      _isolate?.kill(priority: Isolate.immediate);
+      _isolate = null;
+    }
+  }
+
+  void _onDataCallback(dynamic input) {
+    //print(messageFromIsolate);
+
+    input = (input as List).reshape([1, 112, 112, 3]);
+    List output = List.generate(1, (index) => List.filled(512, 0));
+
+    interpreter?.run(input, output);
+    output = output.reshape([512]);
+
+    _predictedData = List.from(output);
+
+  }
+
+  static void _entryPoint(IsolateData isolateData) async {
+    List input = _preProcess(isolateData.cameraImage, isolateData.face);
+    isolateData.sendPort.send(input);
+  }
+
+
+  void setCurrentPrediction(CameraImage cameraImage, Face? face) async {
+    if (interpreter == null) throw Exception('Interpreter is null');
     if (face == null) throw Exception('Face is null');
-    List input = _preProcess(cameraImage, face);
 
-    input = input.reshape([1, 112, 112, 3]);
-    List output = List.generate(1, (index) => List.filled(192, 0));
+    receivePort = ReceivePort();
 
-    this._interpreter?.run(input, output);
-    output = output.reshape([192]);
+    IsolateData isolateData = IsolateData(
+        cameraImage, face, receivePort.sendPort);
 
-    this._predictedData = List.from(output);
+    _isolate = await Isolate.spawn(
+      _entryPoint,
+      isolateData,
+    );
+
+    receivePort.listen(_onDataCallback, onDone: () {
+      _stopIsolate();
+    });
+
   }
 
   Future<User?> predict() async {
-    return _searchResult(this._predictedData);
+    return _searchResult(_predictedData);
   }
 
-  List _preProcess(CameraImage image, Face faceDetected) {
+  static List _preProcess(CameraImage image, Face faceDetected) {
     imglib.Image croppedImage = _cropFace(image, faceDetected);
     imglib.Image img = imglib.copyResizeCropSquare(croppedImage, 112);
 
@@ -72,7 +115,7 @@ class MLService {
     return imageAsList;
   }
 
-  imglib.Image _cropFace(CameraImage image, Face faceDetected) {
+  static imglib.Image _cropFace(CameraImage image, Face faceDetected) {
     imglib.Image convertedImage = _convertCameraImage(image);
     double x = faceDetected.boundingBox.left - 10.0;
     double y = faceDetected.boundingBox.top - 10.0;
@@ -82,13 +125,13 @@ class MLService {
         convertedImage, x.round(), y.round(), w.round(), h.round());
   }
 
-  imglib.Image _convertCameraImage(CameraImage image) {
+  static imglib.Image _convertCameraImage(CameraImage image) {
     var img = convertToImage(image);
     var img1 = imglib.copyRotate(img, -90);
     return img1;
   }
 
-  Float32List imageToByteListFloat32(imglib.Image image) {
+  static Float32List imageToByteListFloat32(imglib.Image image) {
     var convertedBytes = Float32List(1 * 112 * 112 * 3);
     var buffer = Float32List.view(convertedBytes.buffer);
     int pixelIndex = 0;
@@ -114,6 +157,7 @@ class MLService {
 
     for (User u in users) {
       currDist = _euclideanDistance(u.modelData, predictedData);
+      print('user: ${u.user} , distance: $currDist');
       if (currDist <= threshold && currDist < minDist) {
         minDist = currDist;
         predictedResult = u;
@@ -137,4 +181,11 @@ class MLService {
   }
 
   dispose() {}
+}
+
+class IsolateData {
+  IsolateData(this.cameraImage, this.face,  this.sendPort);
+  CameraImage cameraImage;
+  Face face;
+  SendPort sendPort;
 }
